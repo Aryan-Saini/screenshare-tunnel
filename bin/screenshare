@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# screenshare: see and drive a browser on a headless worker from the controller, AnyDesk style.
+#
+#   screenshare [url]          bring up whatever is missing on the worker, open the viewer
+#   screenshare goto <url>     open a tab in the remote Chrome (no viewer needed)
+#   screenshare shot [out]     PNG of the remote screen (default /tmp/screenshare.png)
+#   screenshare status         every link in the chain
+#   screenshare down           close the viewer; the remote session and its logins keep running
+#   screenshare stop           also stop everything screenshare started on the worker
+#
+# Target: SCREENSHARE_HOST (an ssh alias, default "worker"). Streams with RustDesk, direct IP over
+# Tailscale only: no public RustDesk servers, and a firewall rule drops the port everywhere but
+# the tailnet. The password is random per worker, generated there on first run, and read over
+# ssh each time, so nothing secret lives in this repo.
+set -euo pipefail
+
+HOST=${SCREENSHARE_HOST:-worker}
+PORT=21118
+die() { echo "screenshare: $*" >&2; exit 1; }
+
+# Runs on the worker. $1 = action (up|goto|stop|status|password), $2 = optional URL.
+remote() {
+  ssh "$HOST" bash -s -- "$@" <<'REMOTE'
+set -euo pipefail
+ACTION=$1; URL=${2:-}
+# 1080p at 1x. Larger virtual displays look sharper but lag over the stream.
+DISP=:99; RES=1920x1080; SCALE=1; CDP=9222; PORT=21118
+S=$HOME/.screenshare; CFG=$HOME/.config/rustdesk
+mkdir -p "$S" "$CFG" && chmod 700 "$S"
+# A fresh password also replaces any password RustDesk already had, or the viewer would be rejected.
+NEW_PASSWORD=0
+[ -s "$S/password" ] || { (umask 077; head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16 > "$S/password"); NEW_PASSWORD=1; }
+PASSWORD=$(cat "$S/password")
+
+wait_for() { for _ in $(seq 100); do eval "$1" && return 0; sleep 0.1; done; echo "timed out: $1" >&2; return 1; }
+cdp_up() { curl -sf --max-time 1 "http://127.0.0.1:$CDP/json/version" >/dev/null; }
+rd_up() { ss -Hltn "sport = :$PORT" | grep -q .; }
+rd_pid() { pgrep -f "rustdesk --server" | head -1; }
+run_unit() { systemctl --user reset-failed "$1" 2>/dev/null || true; systemd-run --user --quiet --collect --unit="$1" "${@:2}"; }
+chrome_bin() { for b in google-chrome-stable google-chrome chromium chromium-browser; do command -v "$b" && return 0; done; return 1; }
+
+# Direct IP only, a permanent password, and no connection panel drawn over the remote screen.
+# Written only while the server is stopped, because a running server overwrites its config.
+rd_configure() {
+  local f=$CFG/RustDesk2.toml
+  if ! grep -q "allow-hide-cm = 'Y'" "$f" 2>/dev/null; then
+    cat >"$f" <<'T'
+rendezvous_server = '127.0.0.1:21116'
+nat_type = 0
+serial = 0
+
+[options]
+direct-server = 'Y'
+direct-access-port = '21118'
+custom-rendezvous-server = '127.0.0.1'
+relay-server = '127.0.0.1'
+verification-method = 'use-permanent-password'
+approve-mode = 'password'
+allow-hide-cm = 'Y'
+enable-lan-discovery = 'N'
+enable-udp-punch = 'N'
+enable-ipv6-punch = 'N'
+T
+  fi
+  # RustDesk encrypts a plaintext password the first time it loads it.
+  if [ "$NEW_PASSWORD" = 1 ] || ! grep -qE "^password = '.+'" "$CFG/RustDesk.toml" 2>/dev/null; then
+    touch "$CFG/RustDesk.toml"; sed -i '/^password = /d' "$CFG/RustDesk.toml"
+    sed -i "1i password = '$PASSWORD'" "$CFG/RustDesk.toml"
+  fi
+}
+
+# RustDesk listens on every interface. Only loopback and the tailnet may reach it. The rule goes
+# in tailscale's nft table, which is rebuilt on boot, so it is re-added on every run.
+rd_firewall() {
+  command -v nft >/dev/null || { echo "WARNING: no nft; firewall port $PORT to the tailnet yourself" >&2; return 0; }
+  for fam in ip ip6; do
+    sudo -n nft list chain "$fam" filter INPUT >/dev/null 2>&1 || continue
+    sudo -n nft list chain "$fam" filter INPUT | grep -q "dport $PORT" ||
+      sudo -n nft insert rule "$fam" filter INPUT iifname != '{ "lo", "tailscale0" }' tcp dport "$PORT" drop
+  done
+}
+
+case $ACTION in
+password) echo "$PASSWORD" ;;
+up)
+  if ! pgrep -f "Xvfb $DISP" >/dev/null; then
+    run_unit screenshare-xvfb Xvfb "$DISP" -screen 0 "${RES}x24"
+    wait_for "[ -S /tmp/.X11-unix/X${DISP#:} ]"
+  fi
+  if ! cdp_up; then
+    w=${RES%x*}; h=${RES#*x}; chrome=$(chrome_bin) || { echo "no Chrome or Chromium installed" >&2; exit 1; }
+    # A persistent profile: once a human logs in through the viewer, the next headless run is
+    # already signed in. CDP on 9222 lets an agent screenshot or drive the page without a viewer.
+    run_unit screenshare-chrome --setenv=DISPLAY="$DISP" "$chrome" \
+      --user-data-dir="$S/chrome-profile" --remote-debugging-port="$CDP" --remote-allow-origins='*' \
+      --no-first-run --no-default-browser-check --disable-blink-features=AutomationControlled \
+      --force-device-scale-factor="$SCALE" --window-size=$((w / SCALE)),$((h / SCALE)) \
+      --window-position=0,0 --start-maximized "${URL:-about:blank}"
+    wait_for cdp_up
+  elif [ -n "$URL" ]; then
+    curl -sf -X PUT "http://127.0.0.1:$CDP/json/new?$URL" >/dev/null
+  fi
+  # A server capturing another display, started before the config, or holding an old password
+  # gets restarted onto :99.
+  pid=$(rd_pid || true)
+  if [ -n "$pid" ] && { [ "$NEW_PASSWORD" = 1 ] || ! { tr '\0' '\n' <"/proc/$pid/environ" | grep -qx "DISPLAY=$DISP" &&
+                          grep -q "allow-hide-cm = 'Y'" "$CFG/RustDesk2.toml"; }; }; then
+    systemctl --user stop screenshare-rustdesk 2>/dev/null || kill "$pid"
+    wait_for '! rd_up'
+  fi
+  if ! rd_up; then
+    rd_configure
+    rd_firewall
+    run_unit screenshare-rustdesk --setenv=DISPLAY="$DISP" rustdesk --server
+    wait_for rd_up
+  fi
+  rd_firewall
+  ;;
+goto)
+  cdp_up || { echo "no Chrome on :$CDP. Run: screenshare <url>" >&2; exit 1; }
+  curl -sf -X PUT "http://127.0.0.1:$CDP/json/new?$URL" >/dev/null
+  ;;
+status)
+  pgrep -af "Xvfb $DISP" >/dev/null && echo "xvfb      up ($(pgrep -af "Xvfb $DISP" | grep -oE '[0-9]+x[0-9]+x[0-9]+' | head -1))" || echo "xvfb      DOWN"
+  cdp_up && echo "chrome    up ($(curl -s "http://127.0.0.1:$CDP/json/list" | grep -m1 '"url"' | sed 's/.*"url": "\(.*\)".*/\1/'))" || echo "chrome    DOWN"
+  pid=$(rd_pid || true)
+  [ -n "$pid" ] && echo "rustdesk  up ($(tr '\0' '\n' <"/proc/$pid/environ" | grep ^DISPLAY=), $(ss -Htn "sport = :$PORT" | wc -l) viewer(s))" || echo "rustdesk  DOWN"
+  ;;
+stop)
+  systemctl --user stop screenshare-rustdesk screenshare-chrome screenshare-xvfb 2>/dev/null || true
+  echo "stopped the units screenshare started. Anything it adopted is untouched"
+  ;;
+esac
+REMOTE
+}
+
+# The viewer machine. RustDesk rewrites its peer file when a session closes, so this edits it only
+# while the app is not running: fit the window, H.264, best quality at 60fps, Cmd/Ctrl swapped.
+# On an iPhone hotspot (172.20.10.x) it drops to balanced at 30fps; pushing more only queues frames.
+tune_viewer() {
+  local ip=$1 peers quality=best fps=60
+  case "$(uname -s)" in
+    Darwin) peers=~/Library/Preferences/com.carriez.RustDesk/peers; pgrep -x RustDesk >/dev/null && return 0
+            route -n get default 2>/dev/null | grep -q "gateway: 172\.20\.10\." && { quality=balanced; fps=30; echo "on a phone hotspot: balanced quality, 30fps"; } ;;
+    *)      peers=~/.config/rustdesk/peers; pgrep -x rustdesk >/dev/null && return 0 ;;
+  esac
+  mkdir -p "$peers"; touch "$peers/$ip.toml"
+  python3 - "$peers/$ip.toml" "$quality" "$fps" <<'PY'
+import re, sys
+p, quality, fps = sys.argv[1:4]; s = open(p).read()
+top = {"view_style": "'adaptive'", "image_quality": f"'{quality}'", "allow_swap_key": "true",
+       "disable_clipboard": "false", "enable-file-copy-paste": "true", "sync-init-clipboard": "true"}
+opts = {"custom-fps": f"'{fps}'", "codec-preference": "'h264'"}
+def put(s, k, v, section):
+    line = f"{k} = {v}"
+    if re.search(rf"^{re.escape(k)} = ", s, re.M):
+        return re.sub(rf"^{re.escape(k)} = .*$", line, s, flags=re.M)
+    if section and f"[{section}]" in s:
+        return s.replace(f"[{section}]\n", f"[{section}]\n{line}\n", 1)
+    if section:
+        return s + f"\n[{section}]\n{line}\n"
+    return f"{line}\n{s}"
+for k, v in top.items(): s = put(s, k, v, None)
+for k, v in opts.items(): s = put(s, k, v, "options")
+open(p, "w").write(s)
+PY
+}
+
+viewer_quit() {
+  case "$(uname -s)" in
+    Darwin) osascript -e 'quit app "RustDesk"' 2>/dev/null ;;
+    *) pkill -x rustdesk 2>/dev/null ;;
+  esac
+}
+
+case ${1:-up} in
+goto)   [ -n "${2:-}" ] || die "usage: screenshare goto <url>"; remote goto "$2"; echo "opened $2" ;;
+shot)   out=${2:-/tmp/screenshare.png}; ssh "$HOST" 'import -display :99 -window root png:-' >"$out"; echo "$out" ;;
+status)
+  remote status
+  pgrep -xi rustdesk >/dev/null && echo "viewer    open" || echo "viewer    closed"
+  ;;
+down)   viewer_quit && echo "viewer closed" || echo "no viewer" ;;
+stop)   viewer_quit || true; remote stop ;;
+-h|--help|help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
+*)
+  url=""; [ "${1:-up}" = up ] && url=${2:-} || url=$1
+  if [ "$(uname -s)" = Darwin ]; then
+    [ -d /Applications/RustDesk.app ] || brew install --cask rustdesk
+  else
+    command -v rustdesk >/dev/null || die "install the RustDesk client first"
+  fi
+  remote up "$url" || die "remote side failed. Trace it: SCREENSHARE_HOST=$HOST bash -x $0"
+  ip=${SCREENSHARE_IP:-$(tailscale ip -4 "$HOST" 2>/dev/null | head -1)}
+  [ -n "$ip" ] || die "could not resolve $HOST's tailnet IP. Set SCREENSHARE_IP"
+  nc -z -w 3 "$ip" "$PORT" || die "RustDesk on $ip:$PORT is not reachable. Is Tailscale up on both ends?"
+  tune_viewer "$ip"
+  pw=$(remote password)
+  if [ "$(uname -s)" = Darwin ]; then open "rustdesk://connection/new/$ip?password=$pw"
+  else xdg-open "rustdesk://connection/new/$ip?password=$pw" >/dev/null 2>&1 & fi
+  echo "connected to $HOST ($ip)"
+  ;;
+esac

@@ -1,0 +1,34 @@
+{
+  "name": "screenshare-tunnel",
+  "version": "0.1.0",
+  "description": "See and click a browser on a headless Linux box from your laptop, AnyDesk style, in one command. Xvfb + Chrome + RustDesk over Tailscale.",
+  "license": "MIT",
+  "author": "Aryan Saini",
+  "bin": {
+    "screenshare": "bin/screenshare"
+  },
+  "files": [
+    "bin",
+    "skills",
+    "LICENSE",
+    "README.md"
+  ],
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "keywords": [
+    "rustdesk",
+    "xvfb",
+    "headless",
+    "tailscale",
+    "screenshare",
+    "agents",
+    "claude-code"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Aryan-Saini/screenshare-tunnel.git"
+  },
+  "homepage": "https://github.com/Aryan-Saini/screenshare-tunnel"
+}
