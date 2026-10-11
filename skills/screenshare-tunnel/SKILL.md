@@ -17,7 +17,9 @@ screenshare                     # bring it all up and open the viewer
 screenshare https://site/login  # same, and open that URL in the remote Chrome
 ```
 
-The target is `SCREENSHARE_HOST` (an ssh alias, default `worker`). The viewer opens already
+The target is `SCREENSHARE_HOST` (an ssh alias, default `worker`). When worker-chrome runs on
+the worker, the viewer shows that Chrome, so a login the user finishes there is the one agents
+use. `SCREENSHARE_CHROME=own` shows a separate Xvfb `:99` Chrome instead. The viewer opens already
 authenticated with that worker's random password. Nothing to type.
 
 | Command | Does |

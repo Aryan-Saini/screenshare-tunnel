@@ -8,6 +8,10 @@
 #   screenshare down           close the viewer; the remote session and its logins keep running
 #   screenshare stop           also stop everything screenshare started on the worker
 #
+# When worker-chrome (npm worker-chrome) runs on the worker, screenshare shows that Chrome: the
+# same screen and logged-in profile agents drive. SCREENSHARE_CHROME=own uses a separate Xvfb :99
+# and Chrome instead.
+#
 # Target: SCREENSHARE_HOST (an ssh alias, default "worker"). Streams with RustDesk, direct IP over
 # Tailscale only: no public RustDesk servers, and a firewall rule drops the port everywhere but
 # the tailnet. The password is random per worker, generated there on first run, and read over
@@ -15,16 +19,27 @@
 set -euo pipefail
 
 HOST=${SCREENSHARE_HOST:-worker}
+CHROME_MODE=${SCREENSHARE_CHROME:-auto}
 PORT=21118
 die() { echo "screenshare: $*" >&2; exit 1; }
 
-# Runs on the worker. $1 = action (up|goto|stop|status|password), $2 = optional URL.
+# Runs on the worker. $1 = auto|own, $2 = action (up|goto|shot|stop|status|password), $3 = URL.
 remote() {
-  ssh "$HOST" bash -s -- "$@" <<'REMOTE'
+  ssh "$HOST" bash -s -- "$CHROME_MODE" "$@" <<'REMOTE'
 set -euo pipefail
-ACTION=$1; URL=${2:-}
+MODE=$1; ACTION=$2; URL=${3:-}
+export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"   # ssh without a login shell
 # 1080p at 1x. Larger virtual displays look sharper but lag over the stream.
 DISP=:99; RES=1920x1080; SCALE=1; CDP=9222; PORT=21118
+# worker-chrome up: use its display and Chrome. Everything below adopts a running Xvfb and CDP.
+WC=0
+if [ "$MODE" != own ] && command -v worker-chrome >/dev/null &&
+   ep=$(worker-chrome endpoint 2>/dev/null) && curl -sf --max-time 1 "$ep/json/version" >/dev/null; then
+  # Older worker-chrome has no `display`; its unit's environment has the same answer.
+  d=$(worker-chrome display 2>/dev/null || true)
+  [[ $d =~ ^:[0-9]+$ ]] || d=$(systemctl --user show -p Environment worker-chrome.service 2>/dev/null | grep -oE 'DISPLAY=:[0-9]+' | cut -d= -f2)
+  [ -n "$d" ] && { WC=1; DISP=$d; CDP=${ep##*:}; }
+fi
 S=$HOME/.screenshare; CFG=$HOME/.config/rustdesk
 mkdir -p "$S" "$CFG" && chmod 700 "$S"
 # A fresh password also replaces any password RustDesk already had, or the viewer would be rejected.
@@ -82,6 +97,7 @@ rd_firewall() {
 
 case $ACTION in
 password) echo "$PASSWORD" ;;
+shot) import -display "$DISP" -window root png:- ;;
 up)
   if ! pgrep -f "Xvfb $DISP" >/dev/null; then
     run_unit screenshare-xvfb Xvfb "$DISP" -screen 0 "${RES}x24"
@@ -122,6 +138,7 @@ goto)
   ;;
 status)
   pgrep -af "Xvfb $DISP" >/dev/null && echo "xvfb      up ($(pgrep -af "Xvfb $DISP" | grep -oE '[0-9]+x[0-9]+x[0-9]+' | head -1))" || echo "xvfb      DOWN"
+  [ "$WC" = 1 ] && echo "mode      worker-chrome ($DISP, CDP $CDP)" || echo "mode      own ($DISP)"
   cdp_up && echo "chrome    up ($(curl -s "http://127.0.0.1:$CDP/json/list" | grep -m1 '"url"' | sed 's/.*"url": "\(.*\)".*/\1/'))" || echo "chrome    DOWN"
   pid=$(rd_pid || true)
   [ -n "$pid" ] && echo "rustdesk  up ($(tr '\0' '\n' <"/proc/$pid/environ" | grep ^DISPLAY=), $(ss -Htn "sport = :$PORT" | wc -l) viewer(s))" || echo "rustdesk  DOWN"
@@ -175,14 +192,14 @@ viewer_quit() {
 
 case ${1:-up} in
 goto)   [ -n "${2:-}" ] || die "usage: screenshare goto <url>"; remote goto "$2"; echo "opened $2" ;;
-shot)   out=${2:-/tmp/screenshare.png}; ssh "$HOST" 'import -display :99 -window root png:-' >"$out"; echo "$out" ;;
+shot)   out=${2:-/tmp/screenshare.png}; remote shot >"$out"; echo "$out" ;;
 status)
   remote status
   pgrep -xi rustdesk >/dev/null && echo "viewer    open" || echo "viewer    closed"
   ;;
 down)   viewer_quit && echo "viewer closed" || echo "no viewer" ;;
 stop)   viewer_quit || true; remote stop ;;
--h|--help|help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
+-h|--help|help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
 *)
   url=""; [ "${1:-up}" = up ] && url=${2:-} || url=$1
   if [ "$(uname -s)" = Darwin ]; then
@@ -194,6 +211,12 @@ stop)   viewer_quit || true; remote stop ;;
   ip=${SCREENSHARE_IP:-$(tailscale ip -4 "$HOST" 2>/dev/null | head -1)}
   [ -n "$ip" ] || die "could not resolve $HOST's tailnet IP. Set SCREENSHARE_IP"
   nc -z -w 3 "$ip" "$PORT" || die "RustDesk on $ip:$PORT is not reachable. Is Tailscale up on both ends?"
+  # An open viewer keeps its old session window, which goes dead when the server restarts onto
+  # another display. Start a fresh one; it also lets tune_viewer edit the peer file.
+  if pgrep -xi rustdesk >/dev/null; then
+    viewer_quit || true
+    for _ in $(seq 50); do pgrep -xi rustdesk >/dev/null || break; sleep 0.1; done
+  fi
   tune_viewer "$ip"
   pw=$(remote password)
   if [ "$(uname -s)" = Darwin ]; then open "rustdesk://connection/new/$ip?password=$pw"

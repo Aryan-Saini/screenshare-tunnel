@@ -11,6 +11,11 @@ screenshare https://site/login    # same, and open that URL on the worker
 screenshare shot                  # PNG of the remote screen, no human needed
 ```
 
+**With [worker-chrome](https://github.com/Aryan-Saini/worker-chrome)** running on the worker,
+screenshare shows that Chrome: the same screen and logged-in profile your agents drive, so a
+login you finish in the viewer is the login they use. Without it, screenshare starts its own
+Xvfb `:99` and Chrome. `SCREENSHARE_CHROME=own` forces that even when worker-chrome is up.
+
 The agent side is the `screenshare-tunnel` skill: it takes a screenshot first, and only asks you
 to look when the page actually needs a human.
 
@@ -18,6 +23,7 @@ to look when the page actually needs a human.
 
 ```
 worker:      Xvfb :99  <- draws -  Chrome (persistent profile, CDP on 9222)
+             (or worker-chrome's :90 and CDP 9230, adopted as is)
                |
              rustdesk --server   (DISPLAY=:99, direct IP on 21118)
                |  firewall: 21118 dropped on every interface except lo and tailscale0
