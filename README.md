@@ -92,6 +92,9 @@ nc -z -w 3 <worker-lan-ip> 21118       # must be refused
 - **The firewall rule disappears on boot** because tailscale rebuilds its table. Running
   `screenshare` re-adds it. Don't move it to a permanent table without checking chain order.
 - **Black viewer:** the server is capturing another display. `screenshare` restarts it onto `:99`.
+- **Remote screen drawn small in the viewer:** RustDesk is at 1:1 pixels, which halves it on a
+  Retina display. `screenshare` sets fit-to-window for every connection to the worker's IP and
+  as the client default, so connections other tools open (`ip:port`) fit too.
 - **Password rejected:** delete `~/.screenshare/password` on the worker and run `screenshare`.
   It generates a new one and restarts the server with it.
 - **Keeping an existing password:** a worker that already ran RustDesk can keep its password.

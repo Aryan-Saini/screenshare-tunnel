@@ -51,6 +51,8 @@ worker) so the other job doesn't act on the wrong one.
 - `RustDesk on ... is not reachable`: Tailscale is down on one end, or the server died.
   `screenshare status`.
 - **Black viewer:** the server is not capturing `:99`. Run `screenshare` again; it restarts it there.
+- **Remote screen drawn small:** the viewer is at 1:1 pixels. Run `screenshare`;
+  it sets fit-to-window on every connection to the worker and as RustDesk's default.
 - **Password rejected:** delete `~/.screenshare/password` on the worker, run `screenshare`. It
   makes a new one and restarts the server with it.
 - **Xvfb died:** the server does not survive its display going away. `screenshare stop`, then

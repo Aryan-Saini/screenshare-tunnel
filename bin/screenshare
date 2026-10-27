@@ -151,20 +151,23 @@ esac
 REMOTE
 }
 
-# The viewer machine. RustDesk rewrites its peer file when a session closes, so this edits it only
-# while the app is not running: fit the window, H.264, best quality at 60fps, Cmd/Ctrl swapped.
+# The viewer machine. RustDesk rewrites its peer files when a session closes, so this edits them
+# only while the app is not running: fit the window, H.264, best quality at 60fps, Cmd/Ctrl swapped.
 # On an iPhone hotspot (172.20.10.x) it drops to balanced at 30fps; pushing more only queues frames.
+# Every peer on the worker's IP gets it, not just this port's: other tools open ip:port
+# connections (RustDesk names those files base64_<id>.toml). The client defaults get it too, so a
+# connection RustDesk has never seen also starts fitted instead of at 1:1 pixels.
 tune_viewer() {
-  local ip=$1 peers quality=best fps=60
+  local ip=$1 dir quality=best fps=60
   case "$(uname -s)" in
-    Darwin) peers=~/Library/Preferences/com.carriez.RustDesk/peers; pgrep -x RustDesk >/dev/null && return 0
+    Darwin) dir=~/Library/Preferences/com.carriez.RustDesk; pgrep -x RustDesk >/dev/null && return 0
             route -n get default 2>/dev/null | grep -q "gateway: 172\.20\.10\." && { quality=balanced; fps=30; echo "on a phone hotspot: balanced quality, 30fps"; } ;;
-    *)      peers=~/.config/rustdesk/peers; pgrep -x rustdesk >/dev/null && return 0 ;;
+    *)      dir=~/.config/rustdesk; pgrep -x rustdesk >/dev/null && return 0 ;;
   esac
-  mkdir -p "$peers"; touch "$peers/$ip.toml"
-  python3 - "$peers/$ip.toml" "$quality" "$fps" <<'PY'
-import re, sys
-p, quality, fps = sys.argv[1:4]; s = open(p).read()
+  mkdir -p "$dir/peers"; touch "$dir/peers/$ip.toml"
+  python3 - "$dir" "$ip" "$quality" "$fps" <<'PY'
+import base64, binascii, glob, os, re, sys
+d, ip, quality, fps = sys.argv[1:5]
 top = {"view_style": "'adaptive'", "image_quality": f"'{quality}'", "allow_swap_key": "true",
        "disable_clipboard": "false", "enable-file-copy-paste": "true", "sync-init-clipboard": "true"}
 opts = {"custom-fps": f"'{fps}'", "codec-preference": "'h264'"}
@@ -177,9 +180,24 @@ def put(s, k, v, section):
     if section:
         return s + f"\n[{section}]\n{line}\n"
     return f"{line}\n{s}"
-for k, v in top.items(): s = put(s, k, v, None)
-for k, v in opts.items(): s = put(s, k, v, "options")
-open(p, "w").write(s)
+def tune(p, top, opts):
+    s = open(p).read() if os.path.exists(p) else ""
+    for k, v in top.items(): s = put(s, k, v, None)
+    for k, v in opts.items(): s = put(s, k, v, "options")
+    open(p, "w").write(s)
+def peer_id(p):
+    name = os.path.basename(p)[:-len(".toml")]
+    if not name.startswith("base64_"):
+        return name
+    try:
+        return base64.b64decode(name[len("base64_"):]).decode()
+    except (binascii.Error, UnicodeDecodeError):
+        return name
+for p in glob.glob(f"{d}/peers/*.toml"):
+    if peer_id(p) == ip or peer_id(p).startswith(f"{ip}:"):
+        tune(p, top, opts)
+# Settings > Display defaults, all under [options] in RustDesk_default.toml.
+tune(f"{d}/RustDesk_default.toml", {}, {"view_style": "'adaptive'", "image_quality": f"'{quality}'", **opts})
 PY
 }
 
