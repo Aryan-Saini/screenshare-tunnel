@@ -154,9 +154,9 @@ REMOTE
 # The viewer machine. RustDesk rewrites its peer files when a session closes, so this edits them
 # only while the app is not running: fit the window, H.264, best quality at 60fps, Cmd/Ctrl swapped.
 # On an iPhone hotspot (172.20.10.x) it drops to balanced at 30fps; pushing more only queues frames.
-# Every peer on the worker's IP gets it, not just this port's: other tools open ip:port
-# connections (RustDesk names those files base64_<id>.toml). The client defaults get it too, so a
-# connection RustDesk has never seen also starts fitted instead of at 1:1 pixels.
+# Other connections to the worker's IP (ip:port peers other tools open, stored as
+# base64_<id>.toml) and the client defaults only get fit-to-window, so they don't open at 1:1
+# pixels. Their quality is left alone: best at 60fps lagged on those screens.
 tune_viewer() {
   local ip=$1 dir quality=best fps=60
   case "$(uname -s)" in
@@ -193,11 +193,12 @@ def peer_id(p):
         return base64.b64decode(name[len("base64_"):]).decode()
     except (binascii.Error, UnicodeDecodeError):
         return name
+tune(f"{d}/peers/{ip}.toml", top, opts)
 for p in glob.glob(f"{d}/peers/*.toml"):
-    if peer_id(p) == ip or peer_id(p).startswith(f"{ip}:"):
-        tune(p, top, opts)
-# Settings > Display defaults, all under [options] in RustDesk_default.toml.
-tune(f"{d}/RustDesk_default.toml", {}, {"view_style": "'adaptive'", "image_quality": f"'{quality}'", **opts})
+    if peer_id(p).startswith(f"{ip}:"):
+        tune(p, {"view_style": "'adaptive'"}, {})
+# Settings > Display default, under [options] in RustDesk_default.toml.
+tune(f"{d}/RustDesk_default.toml", {}, {"view_style": "'adaptive'"})
 PY
 }
 
