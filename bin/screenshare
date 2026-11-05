@@ -7,6 +7,7 @@
 #   screenshare status         every link in the chain
 #   screenshare down           close the viewer; the remote session and its logins keep running
 #   screenshare stop           also stop everything screenshare started on the worker
+#   screenshare where          the worker's short hostname and the display being shared
 #
 # When worker-chrome (npm worker-chrome) runs on the worker, screenshare shows that Chrome: the
 # same screen and logged-in profile agents drive. SCREENSHARE_CHROME=own uses a separate Xvfb :99
@@ -16,9 +17,15 @@
 # Tailscale only: no public RustDesk servers, and a firewall rule drops the port everywhere but
 # the tailnet. The password is random per worker, generated there on first run, and read over
 # ssh each time, so nothing secret lives in this repo.
+#
+# If voxl (github.com/tembo/voxl) is installed on the worker, the display is also streamed to
+# the browser: voxl on loopback 6999, published tailnet-only by `tailscale serve` on https 16999
+# (a voxl already serving that display is reused). SCREENSHARE_VIEWER_URL replaces the RustDesk
+# viewer with any URL, {worker} and {display} filled in, e.g. a custom app's deep link.
 set -euo pipefail
 
 HOST=${SCREENSHARE_HOST:-worker}
+VIEWER_URL=${SCREENSHARE_VIEWER_URL:-}
 CHROME_MODE=${SCREENSHARE_CHROME:-auto}
 PORT=21118
 die() { echo "screenshare: $*" >&2; exit 1; }
@@ -30,7 +37,7 @@ set -euo pipefail
 MODE=$1; ACTION=$2; URL=${3:-}
 export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"   # ssh without a login shell
 # 1080p at 1x. Larger virtual displays look sharper but lag over the stream.
-DISP=:99; RES=1920x1080; SCALE=1; CDP=9222; PORT=21118
+DISP=:99; RES=1920x1080; SCALE=1; CDP=9222; PORT=21118; VOXL_PORT=6999; VOXL_HTTPS=16999
 # worker-chrome up: use its display and Chrome. Everything below adopts a running Xvfb and CDP.
 WC=0
 if [ "$MODE" != own ] && command -v worker-chrome >/dev/null &&
@@ -84,6 +91,30 @@ T
   fi
 }
 
+# voxl serving $DISP, if any (the worker may run its own, e.g. a systemd unit per display).
+voxl_pid() {
+  local p
+  for p in $(pgrep -x voxl); do
+    tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null | grep -qx "DISPLAY=$DISP" && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
+# Browser stream of $DISP when voxl is installed: loopback only, tailnet HTTPS via tailscale serve
+# (browsers only decode it on HTTPS). Its password lives in $S/voxl.env as VOXL_PASSWORD.
+voxl_ensure() {
+  command -v voxl >/dev/null || return 0
+  voxl_pid >/dev/null && return 0
+  [ -s "$S/voxl.env" ] || (umask 077; echo "VOXL_PASSWORD=$(head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)" >"$S/voxl.env")
+  local host=""
+  command -v jq >/dev/null && host=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // "" | rtrimstr(".")')
+  run_unit screenshare-voxl --setenv=DISPLAY="$DISP" --property=EnvironmentFile="$S/voxl.env" \
+    voxl --addr=127.0.0.1 --port="$VOXL_PORT" --audio-enabled=false ${host:+--allowed-hosts="$host"}
+  wait_for "ss -Hltn 'sport = :$VOXL_PORT' | grep -q ."
+  tailscale serve --bg --https="$VOXL_HTTPS" "http://127.0.0.1:$VOXL_PORT" >/dev/null 2>&1 ||
+    echo "WARNING: tailscale serve failed; voxl is only reachable on the worker" >&2
+}
+
 # RustDesk listens on every interface. Only loopback and the tailnet may reach it. The rule goes
 # in tailscale's nft table, which is rebuilt on boot, so it is re-added on every run.
 rd_firewall() {
@@ -131,7 +162,9 @@ up)
     wait_for rd_up
   fi
   rd_firewall
+  voxl_ensure
   ;;
+where) echo "$(hostname -s) $DISP" ;;
 goto)
   cdp_up || { echo "no Chrome on :$CDP. Run: screenshare <url>" >&2; exit 1; }
   curl -sf -X PUT "http://127.0.0.1:$CDP/json/new?$URL" >/dev/null
@@ -142,9 +175,12 @@ status)
   cdp_up && echo "chrome    up ($(curl -s "http://127.0.0.1:$CDP/json/list" | grep -m1 '"url"' | sed 's/.*"url": "\(.*\)".*/\1/'))" || echo "chrome    DOWN"
   pid=$(rd_pid || true)
   [ -n "$pid" ] && echo "rustdesk  up ($(tr '\0' '\n' <"/proc/$pid/environ" | grep ^DISPLAY=), $(ss -Htn "sport = :$PORT" | wc -l) viewer(s))" || echo "rustdesk  DOWN"
+  if ! command -v voxl >/dev/null; then echo "voxl      not installed"
+  elif pid=$(voxl_pid); then echo "voxl      up (port $(tr '\0' ' ' <"/proc/$pid/cmdline" | grep -oE -- '--port=[0-9]+' | cut -d= -f2))"
+  else echo "voxl      DOWN"; fi
   ;;
 stop)
-  systemctl --user stop screenshare-rustdesk screenshare-chrome screenshare-xvfb 2>/dev/null || true
+  systemctl --user stop screenshare-voxl screenshare-rustdesk screenshare-chrome screenshare-xvfb 2>/dev/null || true
   echo "stopped the units screenshare started. Anything it adopted is untouched"
   ;;
 esac
@@ -199,9 +235,18 @@ status)
   ;;
 down)   viewer_quit && echo "viewer closed" || echo "no viewer" ;;
 stop)   viewer_quit || true; remote stop ;;
--h|--help|help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
+where)  remote where ;;
+-h|--help|help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//' ;;
 *)
   url=""; [ "${1:-up}" = up ] && url=${2:-} || url=$1
+  if [ -n "$VIEWER_URL" ]; then
+    remote up "$url" || die "remote side failed. Trace it: SCREENSHARE_HOST=$HOST bash -x $0"
+    read -r worker disp < <(remote where)
+    link=${VIEWER_URL//\{worker\}/$worker}; link=${link//\{display\}/$disp}
+    if [ "$(uname -s)" = Darwin ]; then open "$link"; else xdg-open "$link" >/dev/null 2>&1 & fi
+    echo "opened $link"
+    exit 0
+  fi
   if [ "$(uname -s)" = Darwin ]; then
     [ -d /Applications/RustDesk.app ] || brew install --cask rustdesk
   else
