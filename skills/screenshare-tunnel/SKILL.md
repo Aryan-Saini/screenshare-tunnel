@@ -27,9 +27,15 @@ authenticated with that worker's random password. Nothing to type.
 | `screenshare [url]` | Starts whatever is missing on the worker, checks the port, opens the viewer |
 | `screenshare goto <url>` | Opens a new tab in the remote Chrome. No viewer |
 | `screenshare shot [out.png]` | Screenshot of the remote screen. Default `/tmp/screenshare.png` |
-| `screenshare status` | Checks Xvfb, Chrome and the RustDesk server |
+| `screenshare status` | Checks Xvfb, Chrome, the RustDesk server and voxl |
 | `screenshare down` | Quits the viewer only. The remote session and logins keep running |
 | `screenshare stop` | Also stops the units screenshare started on the worker |
+| `screenshare where` | Prints the worker's short hostname and the display being shared |
+
+With `SCREENSHARE_VIEWER_URL` set, `screenshare [url]` opens that URL (`{worker}` and
+`{display}` filled in) instead of the RustDesk viewer. If voxl is installed on the worker, the
+display is also streamed to the browser over tailnet HTTPS (port 16999 unless a voxl already
+serves it). RustDesk keeps running either way as the fallback.
 
 ## Agent workflow
 

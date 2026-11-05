@@ -64,6 +64,22 @@ drives it over ssh. The worker only needs these:
 Point it at the worker with `export SCREENSHARE_HOST=<ssh alias>` (default `worker`). If
 `tailscale ip -4 <alias>` can't resolve it, also set `SCREENSHARE_IP` to the worker's tailnet IP.
 
+### Optional: voxl and a custom viewer
+
+If [voxl](https://github.com/tembo/voxl) is on the worker's `PATH`, `screenshare` also streams
+the display to the browser at 60 fps: voxl listens on loopback `6999` and `tailscale serve`
+publishes it tailnet-only at `https://<worker>.<tailnet>.ts.net:16999/?token=<password>`
+(browsers only decode it on HTTPS). The password is `VOXL_PASSWORD` in `~/.screenshare/voxl.env`
+on the worker, generated on first run. A voxl the worker already runs for that display is reused.
+
+`SCREENSHARE_VIEWER_URL` replaces the RustDesk viewer with any URL to open on the controller,
+with `{worker}` (the worker's short hostname) and `{display}` filled in. For example, an app
+that handles its own URL scheme:
+
+```bash
+export SCREENSHARE_VIEWER_URL='myviewer://open?worker={worker}&display={display}'
+```
+
 ## Agent skill
 
 `skills/screenshare-tunnel/SKILL.md` teaches an agent when and how to use this: screenshot
