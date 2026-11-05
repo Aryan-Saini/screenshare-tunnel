@@ -180,7 +180,10 @@ status)
   else echo "voxl      DOWN"; fi
   ;;
 stop)
-  systemctl --user stop screenshare-voxl screenshare-rustdesk screenshare-chrome screenshare-xvfb 2>/dev/null || true
+  # One at a time: systemctl refuses the whole list when any unit in it isn't loaded.
+  for u in screenshare-voxl screenshare-rustdesk screenshare-chrome screenshare-xvfb; do
+    systemctl --user stop "$u" 2>/dev/null || true
+  done
   echo "stopped the units screenshare started. Anything it adopted is untouched"
   ;;
 esac
